@@ -86,15 +86,21 @@ jobs:
       - name: Start container
         run: |
           CONTAINER_HASH=$(docker run --detach --privileged --cgroupns=host \
+            --tmpfs /run \
             -v /tmp/buildd-results:/buildd/out \
             -v /dev:/host-dev \
             -v /sys/fs/cgroup:/sys/fs/cgroup \
             -v ${PWD}:/buildd/sources \
             --security-opt seccomp:unconfined \
-            ${CONTAINER_IMAGE} sleep infinity)
+            ${CONTAINER_IMAGE} /sbin/init)
           echo "CONTAINER_HASH=${CONTAINER_HASH}" >> "$GITHUB_ENV"
-          sleep 5
-          docker inspect -f '{{.State.Running}}' "${CONTAINER_HASH}"
+          for i in $(seq 1 60); do
+            if docker exec "${CONTAINER_HASH}" test -S /run/dbus/system_bus_socket 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec "${CONTAINER_HASH}" systemctl is-system-running || true
 
       - name: Build image
         run: |
