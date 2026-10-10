@@ -1,184 +1,129 @@
-name: droidian rootfs-builder
+name: droidian starlte builder
 
 on:
   workflow_dispatch:
   push:
-  schedule:
-    - cron: "59 23 * * *"
+
+permissions:
+  contents: write
+
+env:
+  CONTAINER_IMAGE: quay.io/droidian/rootfs-builder:bookworm-amd64
 
 jobs:
   once:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     name: Generate matrix
     outputs:
       matrix: ${{ steps.gen-matrix.outputs.matrix }}
-
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
+
+      - name: Install pyyaml
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
 
       - name: Generate matrix
         id: gen-matrix
         run: |
           JOBS="$(./generate_device_recipe.py --matrix)"
-          echo ::set-output name=matrix::${JOBS}
+          echo "matrix=${JOBS}" >> "$GITHUB_OUTPUT"
 
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     needs: once
-
+    timeout-minutes: 360
     strategy:
       fail-fast: true
       matrix:
         config: ${{ fromJson(needs.once.outputs.matrix) }}
-
     name: ${{ matrix.config.job_name }}
-
     steps:
-      - name: Get current date
-        run: echo "current_date=$(date +'%Y%m%d')" >> $GITHUB_ENV
-
-      - name: Set suffix
-        run: echo "release_suffix=_${{ env.current_date }}" >> $GITHUB_ENV
-
-      - name: Set nightly version
-        if: startsWith(github.ref, 'refs/tags/droidian') != true
-        run: echo "DROIDIAN_VERSION=nightly" >> $GITHUB_ENV
-
-      - name: Set version
-        if: startsWith(github.ref, 'refs/tags/droidian') == true
-        run: echo "DROIDIAN_VERSION=$(echo ${{ github.ref }} | rev | cut -d'/' -f1 | rev)" >> $GITHUB_ENV
-
-      - name: Set identifier
-        run: echo "DROIDIAN_IDENTIFIER=${{ matrix.config.product }}-${{ matrix.config.arch }}-${{ matrix.config.edition }}-${{ matrix.config.variant }}-${{ matrix.config.apilevel }}" >> $GITHUB_ENV
-
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
-          lfs: 'true'
-          submodules: 'recursive'
+          lfs: false
+          submodules: recursive
 
-      - name: Checkout submodules
-        run: git submodule update --init --recursive
+      - name: Patch dead upstream dependencies
+        run: |
+          cat > /tmp/patch.py <<'PYEOF'
+          import re
+
+          p = 'rootfs-templates/scripts/install-adaptation.sh'
+          s = open(p).read()
+          s = re.sub(r'^.*repo\.bardia\.tech.*\n', '', s, flags=re.M)
+          s = s.replace('systemctl disable systemd-resolved', 'systemctl disable systemd-resolved || true')
+          s = s.replace('systemctl mask systemd-resolved', 'systemctl mask systemd-resolved || true')
+          open(p, 'w').write(s)
+          print('patched install-adaptation.sh')
+
+          p = 'rootfs-templates/scripts/genimage.sh'
+          s = open(p).read()
+          old = "\n".join([
+              "apt update",
+              "apt install wget -y",
+              "wget https://github.com/Sexynos/droidian-kernel-samsung-exynos9810/releases/download/starlte/boot-starlte.img",
+              "cp ./boot-starlte.img ${WORK_DIR}/target/data/boot.img",
+          ])
+          new = "cp \"$(find ${ROOTFS_PATH}/boot -maxdepth 1 -name 'boot.img-*' | head -n1)\" ${WORK_DIR}/target/data/boot.img"
+          if old not in s:
+              raise SystemExit('ERROR: expected genimage.sh block not found')
+          open(p, 'w').write(s.replace(old, new))
+          print('patched genimage.sh')
+          PYEOF
+          python3 /tmp/patch.py
 
       - name: QEMU set-up
-        uses: docker/setup-qemu-action@v1
+        uses: docker/setup-qemu-action@v3
 
       - name: Create build dir
         run: mkdir -p /tmp/buildd-results
 
       - name: Pull container
-        run: docker pull quay.io/droidian/rootfs-builder:bookworm-amd64
+        run: docker pull ${CONTAINER_IMAGE}
 
-      - name: Start Container
-        run: echo CONTAINER_HASH=$(docker run --detach --privileged -v /tmp/buildd-results:/buildd/out -v /dev:/host-dev -v /sys/fs/cgroup:/sys/fs/cgroup -v ${PWD}:/buildd/sources --security-opt seccomp:unconfined quay.io/droidian/rootfs-builder:bookworm-amd64 /sbin/init) >> $GITHUB_ENV
-
-      - name: Build rootfs
+      - name: Start container
         run: |
-          docker exec $CONTAINER_HASH /bin/sh -c 'cd /buildd/sources; DROIDIAN_VERSION="${{ env.DROIDIAN_VERSION }}" ./generate_device_recipe.py ${{ matrix.config.product }} ${{ matrix.config.arch }} ${{ matrix.config.edition }} ${{ matrix.config.variant }} ${{ matrix.config.apilevel }} && debos --disable-fakemachine generated/droidian.yaml'
+          echo "CONTAINER_HASH=$(docker run --detach --privileged \
+            -v /tmp/buildd-results:/buildd/out \
+            -v /dev:/host-dev \
+            -v /sys/fs/cgroup:/sys/fs/cgroup \
+            -v ${PWD}:/buildd/sources \
+            --security-opt seccomp:unconfined \
+            ${CONTAINER_IMAGE} /sbin/init)" >> "$GITHUB_ENV"
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+      - name: Build image
+        run: |
+          docker exec $CONTAINER_HASH /bin/sh -c 'cd /buildd/sources; DROIDIAN_VERSION=nightly ./generate_device_recipe.py ${{ matrix.config.product }} ${{ matrix.config.arch }} ${{ matrix.config.edition }} ${{ matrix.config.variant }} ${{ matrix.config.apilevel }} && debos --disable-fakemachine generated/droidian.yaml'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: droidian-out-${{ matrix.config.product }}-${{ matrix.config.arch }}-${{ matrix.config.edition }}-${{ matrix.config.variant }}-${{ matrix.config.apilevel }}
+          name: droidian-${{ matrix.config.product }}-${{ matrix.config.arch }}
           path: out/*
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 14
 
-  prepare:
-    runs-on: ubuntu-20.04
-    name: Create GitHub release
+  release:
+    runs-on: ubuntu-22.04
     needs: build
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}${{ steps.create_nightly.outputs.upload_url }}
-
+    name: Publish release
     steps:
-      - name: Delete old nightly release
-        uses: dev-drprasad/delete-tag-and-release@v0.2.1
-        if: startsWith(github.ref, 'refs/tags/droidian') != true
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
         with:
-          delete_release: true # default: false
-          tag_name: nightly # tag name to delete
+          path: droidian-out
+          merge-multiple: true
+
+      - name: Show artifacts
+        run: ls -lR droidian-out
+
+      - name: Create release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Tag snapshot
-        if: startsWith(github.ref, 'refs/tags/droidian') != true
-        uses: tvdias/github-tagger@v0.0.1
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          tag: nightly
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v3
-        with:
-          path: droidian-out
-
-      - name: Create SHA256SUMS
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cd droidian-out
-          for x in droidian-out-*; do
-            cd $x
-            sha256sum * >> ../SHA256SUMS
-            cd ..
-          done
-
-      - name: Create stable release (drafted)
-        id: create_release
-        if: startsWith(github.ref, 'refs/tags/droidian')
-        uses: softprops/action-gh-release@v1
-        with:
-          files: droidian-out/SHA256SUMS
-          tag_name: ${{ github.ref }}
-          draft: true
-          prerelease: false
-
-      - name: Create nightly release
-        id: create_nightly
-        if: startsWith(github.ref, 'refs/tags/droidian') != true
-        uses: softprops/action-gh-release@v1
-        with:
-          files: droidian-out/SHA256SUMS
-          tag_name: nightly
-          draft: false
-          prerelease: true
-
-  publish:
-    runs-on: ubuntu-20.04
-    needs: [once, prepare]
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}${{ steps.create_nightly.outputs.upload_url }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        config: ${{ fromJson(needs.once.outputs.matrix) }}
-
-    name: Publish ${{ matrix.config.job_name }}
-
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v3
-        with:
-          name: droidian-out-${{ matrix.config.product }}-${{ matrix.config.arch }}-${{ matrix.config.edition }}-${{ matrix.config.variant }}-${{ matrix.config.apilevel }}
-          path: droidian-out
-
-      - name: Create stable release (drafted)
-        id: create_release
-        if: startsWith(github.ref, 'refs/tags/droidian')
-        uses: softprops/action-gh-release@v1
-        with:
-          files: droidian-out/*
-          tag_name: ${{ github.ref }}
-          draft: true
-          prerelease: false
-
-      - name: Create nightly release
-        id: create_nightly
-        if: startsWith(github.ref, 'refs/tags/droidian') != true
-        uses: softprops/action-gh-release@v1
-        with:
-          files: droidian-out/*
-          tag_name: nightly
-          draft: false
-          prerelease: true
+          gh release create "starlte-build-${{ github.run_number }}" \
+            --title "Droidian starlte build ${{ github.run_number }}" \
+            --notes "Auto-built Droidian (rootfs + exynos9810 adaptation) for Samsung Galaxy S9 (starlte). Flash via flash_all.sh from the zip." \
+            droidian-out/*
